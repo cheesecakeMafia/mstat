@@ -1,0 +1,974 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+MODE="default"
+JSON_OUTPUT=0
+TARGET=""
+SSH_TIMEOUT=5
+SPEEDTEST_TIMEOUT=45
+
+CURRENT_IP=""
+CURRENT_MACHINE="unknown"
+LOCAL_USER="$(whoami)"
+LOCAL_ALLOWED_IPS_FILE="${MSTAT_ALLOWED_IPS_FILE:-$HOME/.config/mstat/allowed-ips.conf}"
+MACHINES_CONF="${MSTAT_MACHINES_CONF:-$HOME/.config/mstat/machines.conf}"
+
+HEALTH_ISSUE=0
+RUNTIME_ERROR=0
+
+declare -A METRICS=()
+declare -A ALLOWLIST_CACHE=()
+declare -a ALERTS=()
+declare -a WARNINGS=()
+declare -a MACHINE_ORDER=()
+
+USE_COLOR=0
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  USE_COLOR=1
+fi
+
+colorize() {
+  local color="$1"
+  local text="$2"
+  if [[ "$USE_COLOR" -eq 0 || "$JSON_OUTPUT" -eq 1 ]]; then
+    printf '%s' "$text"
+    return
+  fi
+
+  case "$color" in
+    red) printf '\033[31m%s\033[0m' "$text" ;;
+    yellow) printf '\033[33m%s\033[0m' "$text" ;;
+    green) printf '\033[32m%s\033[0m' "$text" ;;
+    cyan) printf '\033[36m%s\033[0m' "$text" ;;
+    bold) printf '\033[1m%s\033[0m' "$text" ;;
+    *) printf '%s' "$text" ;;
+  esac
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  mstat [OPTIONS] [<machine>]
+
+Targets:
+  (none)      Check current machine only
+  <machine>   Also check remote machine via SSH (requires ~/.ssh/config entry)
+
+Mode Flags (mutually exclusive):
+  --quick      Minimal output (uptime + tailscale + CPU + RAM)
+  --full       Add speed test, updates, zombies
+  --security   Add login history + failed SSH attempt summary
+
+Output Flags:
+  --json       Print JSON output
+  --help       Show this help text
+
+Exit codes:
+  0  Healthy
+  1  Health/security issue detected
+  2  Usage/argument error
+  3  Runtime/dependency error
+EOF
+}
+
+die_usage() {
+  printf 'Error: %s\n' "$1" >&2
+  usage >&2
+  exit 2
+}
+
+add_warning() {
+  WARNINGS+=("$1")
+}
+
+runtime_fail() {
+  add_warning "$1"
+  RUNTIME_ERROR=1
+}
+
+add_alert() {
+  local severity="$1"
+  local machine="$2"
+  local message="$3"
+  ALERTS+=("${severity}|${machine}|${message}")
+  case "$severity" in
+    CRITICAL|HIGH)
+      HEALTH_ISSUE=1
+      ;;
+  esac
+}
+
+set_metric() {
+  local machine="$1"
+  local key="$2"
+  local value="$3"
+  METRICS["${machine}:${key}"]="$value"
+}
+
+get_metric() {
+  local machine="$1"
+  local key="$2"
+  printf '%s' "${METRICS["${machine}:${key}"]:-n/a}"
+}
+
+trim_ws() {
+  local text="$1"
+  text="${text#"${text%%[![:space:]]*}"}"
+  text="${text%"${text##*[![:space:]]}"}"
+  printf '%s' "$text"
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+format_mb() {
+  local mb="$1"
+  if [[ ! "$mb" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$mb"
+    return
+  fi
+  if [[ "$mb" -ge 1048576 ]]; then
+    awk -v m="$mb" 'BEGIN {printf "%.1fT", m/1048576}'
+  elif [[ "$mb" -ge 1024 ]]; then
+    awk -v m="$mb" 'BEGIN {printf "%.0fG", m/1024}'
+  else
+    printf '%dM' "$mb"
+  fi
+}
+
+format_bytes() {
+  local bytes="$1"
+  if [[ ! "$bytes" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$bytes"
+    return
+  fi
+  if [[ "$bytes" -ge 1099511627776 ]]; then
+    awk -v b="$bytes" 'BEGIN {printf "%.1fT", b/1099511627776}'
+  elif [[ "$bytes" -ge 1073741824 ]]; then
+    awk -v b="$bytes" 'BEGIN {printf "%.1fG", b/1073741824}'
+  elif [[ "$bytes" -ge 1048576 ]]; then
+    awk -v b="$bytes" 'BEGIN {printf "%.1fM", b/1048576}'
+  elif [[ "$bytes" -ge 1024 ]]; then
+    awk -v b="$bytes" 'BEGIN {printf "%.0fK", b/1024}'
+  else
+    printf '%dB' "$bytes"
+  fi
+}
+
+parse_args() {
+  local mode_count=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --quick)
+        MODE="quick"
+        mode_count=$((mode_count + 1))
+        ;;
+      --full)
+        MODE="full"
+        mode_count=$((mode_count + 1))
+        ;;
+      --security)
+        MODE="security"
+        mode_count=$((mode_count + 1))
+        ;;
+      --json)
+        JSON_OUTPUT=1
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --*)
+        die_usage "Unknown flag: $1"
+        ;;
+      *)
+        if [[ -n "$TARGET" ]]; then
+          die_usage "Only one target is supported; got extra argument: $1"
+        fi
+        TARGET="$1"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ "$mode_count" -gt 1 ]]; then
+    die_usage "--quick, --full, and --security cannot be combined"
+  fi
+}
+
+check_dependencies() {
+  if ! command -v tailscale >/dev/null 2>&1; then
+    printf 'Runtime error: tailscale command not found\n' >&2
+    exit 3
+  fi
+
+  if [[ -n "$TARGET" ]] && ! command -v ssh >/dev/null 2>&1; then
+    printf 'Runtime error: ssh command not found\n' >&2
+    exit 3
+  fi
+}
+
+detect_machine() {
+  CURRENT_IP="$(tailscale ip -4 2>/dev/null | head -1 | tr -d '\r\n')"
+  if [[ -z "$CURRENT_IP" ]]; then
+    printf 'Runtime error: unable to detect tailscale IPv4 address\n' >&2
+    exit 3
+  fi
+
+  if [[ ! -f "$MACHINES_CONF" ]]; then
+    CURRENT_MACHINE="$(hostname -s 2>/dev/null || echo unknown)"
+    add_warning "Missing ${MACHINES_CONF}; using hostname as machine name"
+    return
+  fi
+
+  local match
+  match="$(awk -v ip="$CURRENT_IP" '$1 == ip && $1 !~ /^#/ {print $2; exit}' "$MACHINES_CONF")"
+  if [[ -n "$match" ]]; then
+    CURRENT_MACHINE="$match"
+  else
+    CURRENT_MACHINE="$(hostname -s 2>/dev/null || echo unknown)"
+    add_warning "Tailscale IP ${CURRENT_IP} not found in ${MACHINES_CONF}; using hostname"
+  fi
+}
+
+can_ssh_to() {
+  local target="$1"
+  local cfg resolved_host resolved_user resolved_identity
+
+  cfg="$(ssh -G "$target" 2>/dev/null)" || return 1
+  resolved_host="$(awk '/^hostname / {print $2; exit}' <<<"$cfg")"
+  resolved_user="$(awk '/^user / {print $2; exit}' <<<"$cfg")"
+  resolved_identity="$(awk '/^identityfile / {print $2; exit}' <<<"$cfg")"
+
+  [[ -n "$resolved_host" && -n "$resolved_user" ]] || return 1
+
+  if [[ "$resolved_host" != "$target" || "$resolved_user" != "$LOCAL_USER" || -n "$resolved_identity" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+validate_target_rules() {
+  if [[ -z "$TARGET" ]]; then
+    return
+  fi
+
+  if [[ "$TARGET" == "$CURRENT_MACHINE" ]]; then
+    add_warning "Target '${TARGET}' ignored because current machine is already ${CURRENT_MACHINE}"
+    TARGET=""
+    return
+  fi
+
+  if ! can_ssh_to "$TARGET"; then
+    printf 'Runtime error: no usable SSH config for target "%s"\n' "$TARGET" >&2
+    exit 3
+  fi
+}
+
+is_local_machine() {
+  local machine="$1"
+  [[ "$machine" == "$CURRENT_MACHINE" || "$machine" == "unknown" ]]
+}
+
+run_cmd() {
+  local machine="$1"
+  local cmd="$2"
+  if is_local_machine "$machine"; then
+    bash -lc "$cmd"
+  else
+    ssh \
+      -o BatchMode=yes \
+      -o ConnectTimeout="$SSH_TIMEOUT" \
+      "$machine" \
+      "bash -lc $(printf '%q' "$cmd")"
+  fi
+}
+
+run_privileged_cmd() {
+  local machine="$1"
+  local cmd="$2"
+
+  if is_local_machine "$machine"; then
+    if [[ -t 0 ]]; then
+      sudo bash -lc "$cmd"
+    else
+      sudo -n bash -lc "$cmd"
+    fi
+  else
+    ssh \
+      -o BatchMode=yes \
+      -o ConnectTimeout="$SSH_TIMEOUT" \
+      "$machine" \
+      "sudo -n bash -lc $(printf '%q' "$cmd")"
+  fi
+}
+
+normalize_ip() {
+  local raw="$1"
+  local ip="$raw"
+
+  if [[ "$raw" =~ ^\[([0-9a-fA-F:]+)\]:[0-9]+$ ]]; then
+    ip="${BASH_REMATCH[1]}"
+  elif [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):[0-9]+$ ]]; then
+    ip="${BASH_REMATCH[1]}"
+  elif [[ "$raw" =~ ^([0-9a-fA-F:]+):[0-9]+$ && "$raw" == *:*:* ]]; then
+    ip="${raw%:*}"
+  fi
+
+  printf '%s' "$ip"
+}
+
+looks_like_ip() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$ip" == *:*:* ]]
+}
+
+load_allowed_ips() {
+  local machine="$1"
+  local output=""
+  local file_path=""
+  local rc=0
+
+  if is_local_machine "$machine"; then
+    file_path="$LOCAL_ALLOWED_IPS_FILE"
+    if [[ ! -f "$file_path" ]]; then
+      runtime_fail "Missing ${file_path} on ${machine}; run install.sh to configure allowed IPs"
+      return 1
+    fi
+    output="$(grep -v '^[[:space:]]*#' "$file_path" | awk '{print $1}' | sed '/^[[:space:]]*$/d')"
+  else
+    output="$(run_cmd "$machine" 'file="${MSTAT_ALLOWED_IPS_FILE:-$HOME/.config/mstat/allowed-ips.conf}"; if [[ ! -f "$file" ]]; then echo "__MISSING__"; exit 7; fi; grep -v "^[[:space:]]*#" "$file" | awk "{print \$1}" | sed "/^[[:space:]]*$/d"' 2>/dev/null)"
+    rc=$?
+    if [[ "$rc" -ne 0 || "$output" == "__MISSING__" ]]; then
+      runtime_fail "Missing ~/.config/mstat/allowed-ips.conf on ${machine}; run install.sh on ${machine}"
+      return 1
+    fi
+  fi
+
+  if [[ -z "$(trim_ws "$output")" ]]; then
+    runtime_fail "Allowlist is empty for ${machine}; add Tailscale IPs to allowed-ips.conf"
+    return 1
+  fi
+
+  ALLOWLIST_CACHE["$machine"]="$output"
+  return 0
+}
+
+is_allowed_ip() {
+  local machine="$1"
+  local ip="$2"
+
+  [[ "$ip" == "127.0.0.1" || "$ip" == "::1" || "$ip" == "0.0.0.0" ]] && return 0
+
+  grep -qxF "$ip" <<<"${ALLOWLIST_CACHE["$machine"]:-}"
+}
+
+collect_quick_metrics() {
+  local machine="$1"
+  local out tailscale_ip load1 cores cpu_pct ram used total ram_pct swap swap_used swap_total swap_pct
+  local root_line root_fs root_used_mb root_total_mb root_pct_num
+
+  out="$(run_cmd "$machine" "hostname" 2>/dev/null || true)"
+  [[ -n "$out" ]] || out="$machine"
+  set_metric "$machine" "hostname" "$out"
+
+  out="$(run_cmd "$machine" "uptime -p" 2>/dev/null || true)"
+  [[ -n "$out" ]] || out="unknown"
+  set_metric "$machine" "uptime" "$out"
+
+  out="$(run_cmd "$machine" "tailscale status --self 2>/dev/null | head -n 1" || true)"
+  if [[ -z "$out" ]]; then
+    out="unavailable"
+    add_alert "HIGH" "$machine" "tailscale status unavailable on ${machine}"
+  fi
+  set_metric "$machine" "tailscale" "$out"
+  tailscale_ip="$(awk '{print $1}' <<<"$out")"
+  if [[ "$tailscale_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    set_metric "$machine" "tailscale_ip" "$tailscale_ip"
+  else
+    set_metric "$machine" "tailscale_ip" "unknown"
+  fi
+  if grep -Eqi 'stopped|logged out|offline|not connected|needslogin' <<<"$out"; then
+    add_alert "HIGH" "$machine" "tailscale appears disconnected on ${machine}"
+  fi
+
+  out="$(run_cmd "$machine" "awk '{print \$1}' /proc/loadavg && nproc" 2>/dev/null || true)"
+  load1="$(sed -n '1p' <<<"$out" | tr -d '[:space:]')"
+  cores="$(sed -n '2p' <<<"$out" | tr -d '[:space:]')"
+  if [[ "$load1" =~ ^[0-9]+(\.[0-9]+)?$ && "$cores" =~ ^[0-9]+$ && "$cores" -gt 0 ]]; then
+    cpu_pct="$(awk -v l="$load1" -v c="$cores" 'BEGIN {printf "%.0f", (l/c)*100}')"
+    set_metric "$machine" "cpu" "${load1} (${cores} cores, ${cpu_pct}%)"
+    if awk -v l="$load1" -v c="$cores" 'BEGIN {exit !(l > (2*c))}'; then
+      add_alert "HIGH" "$machine" "CPU load high on ${machine}: load=${load1}, cores=${cores}"
+    fi
+  else
+    set_metric "$machine" "cpu" "unknown"
+  fi
+
+  ram="$(run_cmd "$machine" "free -m | awk '/^Mem:/ {print \$3\" \"\$2}'" 2>/dev/null || true)"
+  read -r used total <<<"$ram"
+  if [[ "${used:-}" =~ ^[0-9]+$ && "${total:-}" =~ ^[0-9]+$ && "$total" -gt 0 ]]; then
+    ram_pct="$(awk -v u="$used" -v t="$total" 'BEGIN {printf "%.0f", (u/t)*100}')"
+    set_metric "$machine" "ram" "${used}/${total} MB (${ram_pct}%)"
+    if [[ "$ram_pct" -gt 90 ]]; then
+      add_alert "HIGH" "$machine" "RAM usage high on ${machine}: ${ram_pct}%"
+    fi
+  else
+    set_metric "$machine" "ram" "unknown"
+  fi
+
+  swap="$(run_cmd "$machine" "free -m | awk '/^Swap:/ {print \$3\" \"\$2}'" 2>/dev/null || true)"
+  read -r swap_used swap_total <<<"$swap"
+  if [[ "${swap_used:-}" =~ ^[0-9]+$ && "${swap_total:-}" =~ ^[0-9]+$ && "$swap_total" -gt 0 ]]; then
+    swap_pct="$(awk -v u="$swap_used" -v t="$swap_total" 'BEGIN {printf "%.0f", (u/t)*100}')"
+    set_metric "$machine" "swap" "${swap_used}/${swap_total} MB (${swap_pct}%)"
+  else
+    set_metric "$machine" "swap" "0/0 MB"
+  fi
+
+  root_line="$(run_cmd "$machine" "df -Pm / | awk 'NR==2{t=\$2; a=\$4; u=t-a; p=(t>0)?int(u*100/t):0; print \$1, u, t, p}'" 2>/dev/null || true)"
+  read -r root_fs root_used_mb root_total_mb root_pct_num <<<"$root_line"
+  if [[ "${root_used_mb:-}" =~ ^[0-9]+$ && "${root_total_mb:-}" =~ ^[0-9]+$ && "${root_pct_num:-}" =~ ^[0-9]+$ ]]; then
+    set_metric "$machine" "disk_root" "$(format_mb "$root_used_mb")/$(format_mb "$root_total_mb") (${root_pct_num}%)"
+    if [[ "$root_pct_num" -gt 90 ]]; then
+      add_alert "HIGH" "$machine" "Disk usage high on ${machine} root partition: ${root_pct_num}%"
+    fi
+  else
+    set_metric "$machine" "disk_root" "unknown"
+  fi
+}
+
+collect_active_sessions() {
+  local machine="$1"
+  local who_ips ss_peers
+  local candidate normalized
+  local suspicious_count=0
+  local total_count=0
+  local suspicious_list=""
+  declare -A seen=()
+
+  if [[ -z "${ALLOWLIST_CACHE["$machine"]:-}" ]]; then
+    if ! load_allowed_ips "$machine"; then
+      return 1
+    fi
+  fi
+
+  who_ips="$(run_cmd "$machine" "who -u 2>/dev/null | sed -n 's/.*(\\([^)]*\\)).*/\\1/p'" || true)"
+  ss_peers="$(run_cmd "$machine" "ss -Htnp state established '( sport = :22 )' 2>/dev/null | awk '{print \$5}'" || true)"
+
+  while IFS= read -r candidate; do
+    candidate="$(trim_ws "$candidate")"
+    [[ -n "$candidate" ]] || continue
+    normalized="$(normalize_ip "$candidate")"
+    if ! looks_like_ip "$normalized"; then
+      continue
+    fi
+    if [[ -z "${seen["$normalized"]+x}" ]]; then
+      seen["$normalized"]=1
+      total_count=$((total_count + 1))
+      if ! is_allowed_ip "$machine" "$normalized"; then
+        suspicious_count=$((suspicious_count + 1))
+        suspicious_list+="${normalized}, "
+        add_alert "CRITICAL" "$machine" "Active SSH session from unexpected IP ${normalized} on ${machine}"
+      fi
+    fi
+  done <<<"$who_ips"$'\n'"$ss_peers"
+
+  set_metric "$machine" "active_ssh_sessions" "$total_count"
+  if [[ "$suspicious_count" -gt 0 ]]; then
+    suspicious_list="${suspicious_list%, }"
+    set_metric "$machine" "suspicious_active_ips" "$suspicious_list"
+  else
+    set_metric "$machine" "suspicious_active_ips" "none"
+  fi
+
+  return 0
+}
+
+collect_default_metrics() {
+  local machine="$1"
+  local root_line home_line root_fs root_used_mb root_total_mb root_pct_num home_fs home_used_mb home_total_mb home_pct_num
+  local failed_units docker_lines docker_count battery ports_out ports_rc
+
+  collect_active_sessions "$machine" || true
+
+  root_line="$(run_cmd "$machine" "df -Pm / | awk 'NR==2{t=\$2; a=\$4; u=t-a; p=(t>0)?int(u*100/t):0; print \$1, u, t, p}'" 2>/dev/null || true)"
+  read -r root_fs root_used_mb root_total_mb root_pct_num <<<"$root_line"
+  if [[ "${root_used_mb:-}" =~ ^[0-9]+$ && "${root_total_mb:-}" =~ ^[0-9]+$ && "${root_pct_num:-}" =~ ^[0-9]+$ ]]; then
+    set_metric "$machine" "disk_root" "$(format_mb "$root_used_mb")/$(format_mb "$root_total_mb") (${root_pct_num}%)"
+    if [[ "$root_pct_num" -gt 90 ]]; then
+      add_alert "HIGH" "$machine" "Disk usage high on ${machine} root partition: ${root_pct_num}%"
+    fi
+  else
+    set_metric "$machine" "disk_root" "unknown"
+  fi
+
+  home_line="$(run_cmd "$machine" "df -Pm /home 2>/dev/null | awk 'NR==2{t=\$2; a=\$4; u=t-a; p=(t>0)?int(u*100/t):0; print \$1, u, t, p}'" || true)"
+  read -r home_fs home_used_mb home_total_mb home_pct_num <<<"$home_line"
+  if [[ -n "${home_fs:-}" && "$home_fs" != "$root_fs" ]]; then
+    set_metric "$machine" "disk_home" "$(format_mb "$home_used_mb")/$(format_mb "$home_total_mb") (${home_pct_num}%)"
+    if [[ "${home_pct_num:-0}" =~ ^[0-9]+$ ]] && [[ "${home_pct_num:-0}" -gt 90 ]]; then
+      add_alert "HIGH" "$machine" "Disk usage high on ${machine} /home partition: ${home_pct_num}%"
+    fi
+  else
+    set_metric "$machine" "disk_home" "same as /"
+  fi
+
+  failed_units="$(run_cmd "$machine" "systemctl --failed --no-legend --plain 2>/dev/null | wc -l" || true)"
+  failed_units="$(trim_ws "$failed_units")"
+  [[ "$failed_units" =~ ^[0-9]+$ ]] || failed_units="unknown"
+  set_metric "$machine" "failed_systemd_units" "$failed_units"
+
+  docker_lines="$(run_cmd "$machine" 'if command -v docker >/dev/null 2>&1; then docker ps -a --format "{{.Names}}|{{.Status}}" 2>/dev/null; else echo "__NO_DOCKER__"; fi' || true)"
+  if [[ "$docker_lines" == "__NO_DOCKER__" ]]; then
+    set_metric "$machine" "docker_containers" "n/a"
+  else
+    docker_count="$(awk 'NF {count++} END {print count+0}' <<<"$docker_lines")"
+    set_metric "$machine" "docker_containers" "$docker_count"
+  fi
+
+  ports_out="$(run_privileged_cmd "$machine" "ss -Htlpn 2>/dev/null" 2>/dev/null)"
+  ports_rc=$?
+  if [[ "$ports_rc" -eq 0 ]]; then
+    set_metric "$machine" "listening_ports" "$(awk 'NF {count++} END {print count+0}' <<<"$ports_out")"
+  else
+    set_metric "$machine" "listening_ports" "[requires sudo]"
+  fi
+
+  battery="$(run_cmd "$machine" "if [[ -r /sys/class/power_supply/BAT0/capacity ]]; then cat /sys/class/power_supply/BAT0/capacity; else echo n/a; fi" 2>/dev/null || true)"
+  battery="$(trim_ws "$battery")"
+  if [[ "$battery" =~ ^[0-9]+$ ]]; then
+    set_metric "$machine" "battery" "${battery}%"
+  else
+    set_metric "$machine" "battery" "n/a"
+  fi
+
+  return 0
+}
+
+collect_full_metrics() {
+  local machine="$1"
+  local speed_out down up updates_raw updates zombies
+  local out cached_mb avail_mb total_mb cached_pct avail_pct cpu_temp
+  local net_summary iface rx tx line
+
+  speed_out="$(run_cmd "$machine" "if command -v speedtest-cli >/dev/null 2>&1; then timeout ${SPEEDTEST_TIMEOUT} speedtest-cli --simple 2>/dev/null; else echo '__NO_SPEEDTEST__'; fi" || true)"
+  if [[ "$speed_out" == "__NO_SPEEDTEST__" ]]; then
+    set_metric "$machine" "speedtest" "n/a"
+  else
+    down="$(awk -F': *' '/^Download:/ {print $2; exit}' <<<"$speed_out")"
+    up="$(awk -F': *' '/^Upload:/ {print $2; exit}' <<<"$speed_out")"
+    if [[ -n "$down" || -n "$up" ]]; then
+      set_metric "$machine" "speedtest" "down ${down:-n/a}, up ${up:-n/a}"
+    else
+      set_metric "$machine" "speedtest" "timeout/unavailable"
+      add_warning "speedtest unavailable on ${machine} (timed out or failed)"
+    fi
+  fi
+
+  updates_raw="$(run_cmd "$machine" 'if [[ -x /usr/lib/update-notifier/apt-check ]]; then /usr/lib/update-notifier/apt-check 2>&1; else echo "__NO_APT_CHECK__"; fi' || true)"
+  if [[ "$updates_raw" =~ ^[0-9]+\;[0-9]+$ ]]; then
+    updates="$(awk -F';' '{print $1 " updates, " $2 " security"}' <<<"$updates_raw")"
+    set_metric "$machine" "pending_updates" "$updates"
+  else
+    set_metric "$machine" "pending_updates" "n/a"
+  fi
+
+  zombies="$(run_cmd "$machine" "ps -eo stat= | awk '\$1 ~ /^Z/ {c++} END {print c+0}'" 2>/dev/null || true)"
+  zombies="$(trim_ws "$zombies")"
+  [[ "$zombies" =~ ^[0-9]+$ ]] || zombies="unknown"
+  set_metric "$machine" "zombie_processes" "$zombies"
+
+  # CPU model
+  out="$(run_cmd "$machine" "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2" 2>/dev/null || true)"
+  out="$(trim_ws "$out")"
+  set_metric "$machine" "cpu_model" "${out:-unknown}"
+
+  # CPU temperature (k10temp=AMD, coretemp=Intel)
+  out="$(run_cmd "$machine" 'for d in /sys/class/hwmon/hwmon*; do case "$(cat "$d/name" 2>/dev/null)" in k10temp|coretemp) cat "$d/temp1_input" 2>/dev/null; break;; esac; done' 2>/dev/null || true)"
+  out="$(trim_ws "$out")"
+  if [[ "$out" =~ ^[0-9]+$ ]]; then
+    cpu_temp=$((out / 1000))
+    set_metric "$machine" "cpu_temp" "${cpu_temp}°C"
+    if [[ "$cpu_temp" -gt 90 ]]; then
+      add_alert "HIGH" "$machine" "CPU temperature high on ${machine}: ${cpu_temp}°C"
+    fi
+  else
+    set_metric "$machine" "cpu_temp" "n/a"
+  fi
+
+  # RAM cached (buff/cache)
+  out="$(run_cmd "$machine" "free -m | awk '/^Mem:/ {print \$6\" \"\$2}'" 2>/dev/null || true)"
+  read -r cached_mb total_mb <<<"$out"
+  if [[ "${cached_mb:-}" =~ ^[0-9]+$ && "${total_mb:-}" =~ ^[0-9]+$ && "$total_mb" -gt 0 ]]; then
+    cached_pct="$(awk -v c="$cached_mb" -v t="$total_mb" 'BEGIN {printf "%.0f", (c/t)*100}')"
+    set_metric "$machine" "ram_cached" "${cached_mb}/${total_mb} MB (${cached_pct}%)"
+  else
+    set_metric "$machine" "ram_cached" "unknown"
+  fi
+
+  # RAM available
+  out="$(run_cmd "$machine" "free -m | awk '/^Mem:/ {print \$7\" \"\$2}'" 2>/dev/null || true)"
+  read -r avail_mb total_mb <<<"$out"
+  if [[ "${avail_mb:-}" =~ ^[0-9]+$ && "${total_mb:-}" =~ ^[0-9]+$ && "$total_mb" -gt 0 ]]; then
+    avail_pct="$(awk -v a="$avail_mb" -v t="$total_mb" 'BEGIN {printf "%.0f", (a/t)*100}')"
+    set_metric "$machine" "ram_available" "${avail_mb}/${total_mb} MB (${avail_pct}%)"
+  else
+    set_metric "$machine" "ram_available" "unknown"
+  fi
+
+  # Network interfaces (routable IPv4)
+  out="$(run_cmd "$machine" "ip -4 addr show up scope global 2>/dev/null | awk '/inet / {split(\$2,a,\"/\"); printf \"%s (%s), \", \$NF, a[1]}'" || true)"
+  out="${out%, }"
+  set_metric "$machine" "network_interfaces" "${out:-none}"
+
+  # Network traffic totals (cumulative since boot)
+  out="$(run_cmd "$machine" "awk 'NR>2 {iface=\$1; sub(/:$/,\"\",iface); rx=\$2; tx=\$10; if (iface != \"lo\" && rx+tx > 0) print iface, rx, tx}' /proc/net/dev" 2>/dev/null || true)"
+  net_summary=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r iface rx tx <<<"$line"
+    net_summary+="${iface}: rx $(format_bytes "$rx") / tx $(format_bytes "$tx"), "
+  done <<<"$out"
+  net_summary="${net_summary%, }"
+  set_metric "$machine" "network_traffic" "${net_summary:-n/a}"
+
+  # Top 10 processes by CPU%
+  out="$(run_cmd "$machine" "ps -eo pid=,comm=,%cpu=,%mem= --sort=-%cpu --no-headers 2>/dev/null | head -10" || true)"
+  if [[ -n "$(trim_ws "$out")" ]]; then
+    set_metric "$machine" "top_processes" "$out"
+  else
+    set_metric "$machine" "top_processes" "n/a"
+  fi
+}
+
+detect_ssh_unit() {
+  local machine="$1"
+  run_cmd "$machine" "if systemctl list-unit-files --type=service --no-legend | grep -q '^ssh\\.service'; then echo ssh; elif systemctl list-unit-files --type=service --no-legend | grep -q '^sshd\\.service'; then echo sshd; else echo ''; fi" 2>/dev/null || true
+}
+
+collect_security_metrics() {
+  local machine="$1"
+  local last_out history_ips ip suspicious_history=""
+  local ssh_unit logs logs_rc fail_summary
+  declare -A seen_history=()
+
+  if [[ -z "${ALLOWLIST_CACHE["$machine"]:-}" ]]; then
+    if ! load_allowed_ips "$machine"; then
+      return 1
+    fi
+  fi
+
+  # Filter last output to pts/ lines only — excludes local console sessions
+  # (seat0, :0, :1, reboot, system boot) which show 0.0.0.0 as a placeholder
+  last_out="$(run_cmd "$machine" "last -i -n 100 2>/dev/null | grep 'pts/'" || true)"
+  history_ips="$(grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$last_out" | sort -u || true)"
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] || continue
+    [[ -n "${seen_history["$ip"]+x}" ]] && continue
+    seen_history["$ip"]=1
+    if ! is_allowed_ip "$machine" "$ip"; then
+      suspicious_history+="${ip}, "
+      add_alert "HIGH" "$machine" "Login history contains unexpected IP ${ip} on ${machine}"
+    fi
+  done <<<"$history_ips"
+
+  if [[ -n "$suspicious_history" ]]; then
+    set_metric "$machine" "suspicious_login_history_ips" "${suspicious_history%, }"
+  else
+    set_metric "$machine" "suspicious_login_history_ips" "none"
+  fi
+
+  ssh_unit="$(trim_ws "$(detect_ssh_unit "$machine")")"
+  logs=""
+  if [[ -n "$ssh_unit" ]]; then
+    logs="$(run_privileged_cmd "$machine" "journalctl -u ${ssh_unit} --since '7 days ago' --no-pager 2>/dev/null | grep -E 'Failed password|Invalid user|authentication failure' || true" 2>/dev/null)"
+    logs_rc=$?
+    if [[ "$logs_rc" -ne 0 ]]; then
+      logs="$(run_privileged_cmd "$machine" "grep -E 'Failed password|Invalid user|authentication failure' /var/log/auth.log 2>/dev/null || true" 2>/dev/null)"
+      logs_rc=$?
+    fi
+  else
+    logs="$(run_privileged_cmd "$machine" "grep -E 'Failed password|Invalid user|authentication failure' /var/log/auth.log 2>/dev/null || true" 2>/dev/null)"
+    logs_rc=$?
+  fi
+
+  if [[ "${logs_rc:-1}" -eq 0 ]]; then
+    fail_summary="$(grep -Eo 'from ([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$logs" | awk '{print $2}' | sort | uniq -c | awk '{print $2":"$1}' | paste -sd', ' -)"
+    set_metric "$machine" "failed_ssh_attempts_7d" "${fail_summary:-none}"
+  else
+    set_metric "$machine" "failed_ssh_attempts_7d" "[requires sudo]"
+  fi
+
+  return 0
+}
+
+collect_machine() {
+  local machine="$1"
+  MACHINE_ORDER+=("$machine")
+
+  if ! run_cmd "$machine" "echo ok" >/dev/null 2>&1; then
+    runtime_fail "Unable to collect data from ${machine} (SSH/connectivity failed)"
+    set_metric "$machine" "hostname" "$machine"
+    set_metric "$machine" "status" "offline"
+    return 1
+  fi
+
+  collect_quick_metrics "$machine"
+
+  if [[ "$MODE" != "quick" ]]; then
+    collect_default_metrics "$machine" || true
+  fi
+
+  if [[ "$MODE" == "full" ]]; then
+    collect_full_metrics "$machine"
+  elif [[ "$MODE" == "security" ]]; then
+    collect_security_metrics "$machine" || true
+  fi
+
+  return 0
+}
+
+pct_of_metric() {
+  local machine="$1"
+  local key="$2"
+  local value pct
+  value="$(get_metric "$machine" "$key")"
+  pct="$(grep -Eo '[0-9]+%' <<<"$value" | head -1 | tr -d '%')"
+  printf '%s' "$pct"
+}
+
+colored_metric() {
+  local machine="$1"
+  local key="$2"
+  local value pct color
+
+  value="$(get_metric "$machine" "$key")"
+  pct="$(pct_of_metric "$machine" "$key")"
+  color="green"
+  if [[ "$pct" =~ ^[0-9]+$ ]]; then
+    if [[ "$pct" -gt 80 ]]; then
+      color="red"
+    elif [[ "$pct" -gt 50 ]]; then
+      color="yellow"
+    fi
+  fi
+
+  colorize "$color" "$value"
+}
+
+render_text() {
+  local machine title machine_ip line
+  local has_machine_alerts=0
+  local severity alert_machine message
+
+  for machine in "${MACHINE_ORDER[@]}"; do
+    machine_ip="$(get_metric "$machine" "tailscale_ip")"
+    title="$(printf 'Machine: %s (%s)' "$machine" "$machine_ip")"
+    printf '\n%s\n' "$(colorize bold "$title")"
+    printf '  %-22s %s\n' "Hostname:" "$(get_metric "$machine" "hostname")"
+    printf '  %-22s %s\n' "Uptime:" "$(get_metric "$machine" "uptime")"
+    printf '  %-22s %s\n' "Tailscale:" "$(get_metric "$machine" "tailscale")"
+    printf '  %-22s %s\n' "CPU:" "$(colored_metric "$machine" "cpu")"
+    printf '  %-22s %s\n' "RAM:" "$(colored_metric "$machine" "ram")"
+    printf '  %-22s %s\n' "Disk /:" "$(colored_metric "$machine" "disk_root")"
+
+    if [[ "$MODE" != "quick" ]]; then
+      printf '  %-22s %s\n' "Swap:" "$(get_metric "$machine" "swap")"
+      printf '  %-22s %s\n' "Disk /home:" "$(colored_metric "$machine" "disk_home")"
+      printf '  %-22s %s\n' "Active SSH sessions:" "$(get_metric "$machine" "active_ssh_sessions")"
+      printf '  %-22s %s\n' "Suspicious active IPs:" "$(get_metric "$machine" "suspicious_active_ips")"
+      printf '  %-22s %s\n' "Failed systemd units:" "$(get_metric "$machine" "failed_systemd_units")"
+      printf '  %-22s %s\n' "Docker containers:" "$(get_metric "$machine" "docker_containers")"
+      printf '  %-22s %s\n' "Listening ports:" "$(get_metric "$machine" "listening_ports")"
+      printf '  %-22s %s\n' "Battery:" "$(get_metric "$machine" "battery")"
+    fi
+
+    if [[ "$MODE" == "full" ]]; then
+      printf '  %-22s %s\n' "CPU model:" "$(get_metric "$machine" "cpu_model")"
+      printf '  %-22s %s\n' "CPU temp:" "$(get_metric "$machine" "cpu_temp")"
+      printf '  %-22s %s\n' "RAM cached:" "$(get_metric "$machine" "ram_cached")"
+      printf '  %-22s %s\n' "RAM available:" "$(get_metric "$machine" "ram_available")"
+      printf '  %-22s %s\n' "Network:" "$(get_metric "$machine" "network_interfaces")"
+      printf '  %-22s %s\n' "Network traffic:" "$(get_metric "$machine" "network_traffic")"
+      printf '  %-22s %s\n' "Speedtest:" "$(get_metric "$machine" "speedtest")"
+      printf '  %-22s %s\n' "Pending updates:" "$(get_metric "$machine" "pending_updates")"
+      printf '  %-22s %s\n' "Zombie processes:" "$(get_metric "$machine" "zombie_processes")"
+      printf '  %s\n' "Top processes (CPU):"
+      while IFS= read -r line; do
+        [[ -n "$(trim_ws "$line")" ]] || continue
+        printf '    %s\n' "$line"
+      done <<<"$(get_metric "$machine" "top_processes")"
+    fi
+
+    if [[ "$MODE" == "security" ]]; then
+      printf '  %-22s %s\n' "Suspicious history IPs:" "$(get_metric "$machine" "suspicious_login_history_ips")"
+      printf '  %-22s %s\n' "Failed SSH (7d):" "$(get_metric "$machine" "failed_ssh_attempts_7d")"
+    fi
+
+    has_machine_alerts=0
+    for message in "${ALERTS[@]}"; do
+      IFS='|' read -r severity alert_machine message <<<"$message"
+      if [[ "$alert_machine" == "$machine" ]]; then
+        if [[ "$has_machine_alerts" -eq 0 ]]; then
+          printf '  %s\n' "$(colorize bold "Alerts:")"
+          has_machine_alerts=1
+        fi
+        case "$severity" in
+          CRITICAL) printf '    - %s %s\n' "$(colorize red "[$severity]")" "$message" ;;
+          HIGH) printf '    - %s %s\n' "$(colorize yellow "[$severity]")" "$message" ;;
+          *) printf '    - [%s] %s\n' "$severity" "$message" ;;
+        esac
+      fi
+    done
+  done
+
+  if [[ "${#WARNINGS[@]}" -gt 0 ]]; then
+    printf '\n%s\n' "$(colorize bold "Warnings:")"
+    for message in "${WARNINGS[@]}"; do
+      printf '  - %s\n' "$message"
+    done
+  fi
+
+  if [[ "$RUNTIME_ERROR" -eq 1 ]]; then
+    printf '\n%s\n' "$(colorize red "Result: RUNTIME ERROR")"
+  elif [[ "$HEALTH_ISSUE" -eq 1 ]]; then
+    printf '\n%s\n' "$(colorize red "Result: ISSUES DETECTED")"
+  else
+    printf '\n%s\n' "$(colorize green "Result: HEALTHY")"
+  fi
+}
+
+render_json_machine_metrics() {
+  local machine="$1"
+  local first=1
+  local key
+  mapfile -t keys < <(
+    for key in "${!METRICS[@]}"; do
+      if [[ "$key" == "${machine}:"* ]]; then
+        echo "${key#${machine}:}"
+      fi
+    done | sort
+  )
+
+  printf '{'
+  for key in "${keys[@]}"; do
+    if [[ "$first" -eq 0 ]]; then
+      printf ','
+    fi
+    first=0
+    printf '"%s":"%s"' "$(json_escape "$key")" "$(json_escape "$(get_metric "$machine" "$key")")"
+  done
+  printf '}'
+}
+
+render_json_machine_alerts() {
+  local machine="$1"
+  local first=1
+  local record severity alert_machine message
+  printf '['
+  for record in "${ALERTS[@]}"; do
+    IFS='|' read -r severity alert_machine message <<<"$record"
+    if [[ "$alert_machine" == "$machine" ]]; then
+      if [[ "$first" -eq 0 ]]; then
+        printf ','
+      fi
+      first=0
+      printf '{"severity":"%s","message":"%s"}' "$(json_escape "$severity")" "$(json_escape "$message")"
+    fi
+  done
+  printf ']'
+}
+
+render_json() {
+  local first=1
+  local machine warning
+
+  printf '{'
+  printf '"mode":"%s",' "$(json_escape "$MODE")"
+  printf '"current_machine":"%s",' "$(json_escape "$CURRENT_MACHINE")"
+  printf '"current_ip":"%s",' "$(json_escape "$CURRENT_IP")"
+  printf '"machines":['
+
+  for machine in "${MACHINE_ORDER[@]}"; do
+    if [[ "$first" -eq 0 ]]; then
+      printf ','
+    fi
+    first=0
+    printf '{'
+    printf '"name":"%s",' "$(json_escape "$machine")"
+    printf '"metrics":'
+    render_json_machine_metrics "$machine"
+    printf ','
+    printf '"alerts":'
+    render_json_machine_alerts "$machine"
+    printf '}'
+  done
+  printf '],'
+
+  printf '"warnings":['
+  first=1
+  for warning in "${WARNINGS[@]}"; do
+    if [[ "$first" -eq 0 ]]; then
+      printf ','
+    fi
+    first=0
+    printf '"%s"' "$(json_escape "$warning")"
+  done
+  printf '],'
+
+  if [[ "$RUNTIME_ERROR" -eq 1 ]]; then
+    printf '"result":"runtime_error"'
+  elif [[ "$HEALTH_ISSUE" -eq 1 ]]; then
+    printf '"result":"issues_detected"'
+  else
+    printf '"result":"healthy"'
+  fi
+  printf '}\n'
+}
+
+main() {
+  local machines=()
+  local machine
+
+  parse_args "$@"
+  check_dependencies
+  detect_machine
+  validate_target_rules
+
+  machines=("$CURRENT_MACHINE")
+  if [[ -n "$TARGET" ]]; then
+    machines+=("$TARGET")
+  fi
+
+  for machine in "${machines[@]}"; do
+    collect_machine "$machine" || true
+  done
+
+  if [[ "$JSON_OUTPUT" -eq 1 ]]; then
+    render_json
+  else
+    render_text
+  fi
+
+  if [[ "$RUNTIME_ERROR" -eq 1 ]]; then
+    exit 3
+  elif [[ "$HEALTH_ISSUE" -eq 1 ]]; then
+    exit 1
+  fi
+  exit 0
+}
+
+main "$@"
