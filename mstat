@@ -165,6 +165,177 @@ format_bytes() {
   fi
 }
 
+format_usage_mb() {
+  local used_mb="$1"
+  local total_mb="$2"
+  local pct
+
+  if [[ ! "$used_mb" =~ ^[0-9]+$ || ! "$total_mb" =~ ^[0-9]+$ || "$total_mb" -le 0 ]]; then
+    printf 'unknown'
+    return
+  fi
+
+  pct="$(awk -v u="$used_mb" -v t="$total_mb" 'BEGIN {printf "%.0f", (u/t)*100}')"
+  printf '%s/%s (%s%%)' "$(format_mb "$used_mb")" "$(format_mb "$total_mb")" "$pct"
+}
+
+classify_storage_kind() {
+  local rota="$1"
+  case "$rota" in
+    1) printf 'HDD' ;;
+    0) printf 'SSD' ;;
+    *) printf 'UNKNOWN' ;;
+  esac
+}
+
+get_mount_usage_mb() {
+  local machine="$1"
+  local mountpoint="$2"
+  local quoted_mount
+
+  printf -v quoted_mount '%q' "$mountpoint"
+  run_cmd "$machine" "df -Pm ${quoted_mount} 2>/dev/null | awk 'NR==2{t=\$2; a=\$4; u=t-a; p=(t>0)?int(u*100/t):0; print u, t, p}'" 2>/dev/null || true
+}
+
+collect_storage_metrics() {
+  local machine="$1"
+  local lsblk_out mounts_out line
+  local current_name current_kname current_pkname current_type current_rm current_rota current_tran current_hotplug
+  local source target fstype source_key canonical_name parent_name top_name top_type kind usage_line
+  local used_mb total_mb pct_num
+  local quoted_source quoted_target
+  declare -A alias_to_name=()
+  declare -A parent_of=()
+  declare -A type_of=()
+  declare -A rm_of=()
+  declare -A rota_of=()
+  declare -A tran_of=()
+  declare -A hotplug_of=()
+  declare -A seen_mounts=()
+  declare -A total_by_kind=()
+  declare -A used_by_kind=()
+
+  lsblk_out="$(run_cmd "$machine" "lsblk -P -o NAME,KNAME,PKNAME,TYPE,RM,ROTA,TRAN,HOTPLUG" 2>/dev/null || true)"
+  if [[ -z "$(trim_ws "$lsblk_out")" ]]; then
+    set_metric "$machine" "ssd" "unknown"
+    set_metric "$machine" "hdd" "unknown"
+    runtime_fail "Unable to read block-device inventory on ${machine}"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$(trim_ws "$line")" ]] || continue
+
+    current_name=""
+    current_kname=""
+    current_pkname=""
+    current_type=""
+    current_rm=""
+    current_rota=""
+    current_tran=""
+    current_hotplug=""
+
+    eval "$(sed \
+      -e 's/\<NAME=/current_name=/' \
+      -e 's/\<KNAME=/current_kname=/' \
+      -e 's/\<PKNAME=/current_pkname=/' \
+      -e 's/\<TYPE=/current_type=/' \
+      -e 's/\<RM=/current_rm=/' \
+      -e 's/\<ROTA=/current_rota=/' \
+      -e 's/\<TRAN=/current_tran=/' \
+      -e 's/\<HOTPLUG=/current_hotplug=/' <<<"$line")"
+
+    [[ -n "$current_name" ]] || continue
+    alias_to_name["$current_name"]="$current_name"
+    if [[ -n "$current_kname" ]]; then
+      alias_to_name["$current_kname"]="$current_name"
+    fi
+    parent_of["$current_name"]="$current_pkname"
+    type_of["$current_name"]="$current_type"
+    rm_of["$current_name"]="$current_rm"
+    rota_of["$current_name"]="$current_rota"
+    tran_of["$current_name"]="$current_tran"
+    hotplug_of["$current_name"]="$current_hotplug"
+  done <<<"$lsblk_out"
+
+  mounts_out="$(run_cmd "$machine" "findmnt -P -n -o SOURCE,TARGET,FSTYPE" 2>/dev/null || true)"
+  if [[ -z "$(trim_ws "$mounts_out")" ]]; then
+    set_metric "$machine" "ssd" "none"
+    set_metric "$machine" "hdd" "none"
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$(trim_ws "$line")" ]] || continue
+
+    source=""
+    target=""
+    fstype=""
+    eval "$(sed \
+      -e 's/\<SOURCE=/source=/' \
+      -e 's/\<TARGET=/target=/' \
+      -e 's/\<FSTYPE=/fstype=/' <<<"$line")"
+
+    [[ "$source" == /dev/* ]] || continue
+    [[ -n "$target" ]] || continue
+
+    source_key="${source##*/}"
+    canonical_name="${alias_to_name["$source_key"]:-}"
+    [[ -n "$canonical_name" ]] || continue
+
+    top_name="$canonical_name"
+    while [[ -n "${parent_of["$top_name"]:-}" ]]; do
+      parent_name="${parent_of["$top_name"]}"
+      [[ -n "$parent_name" ]] || break
+      top_name="${alias_to_name["$parent_name"]:-$parent_name}"
+    done
+
+    top_type="${type_of["$top_name"]:-}"
+    [[ "$top_type" == "disk" ]] || continue
+
+    if [[ "${rm_of["$top_name"]:-0}" == "1" || "${hotplug_of["$top_name"]:-0}" == "1" || "${tran_of["$top_name"]:-}" == "usb" ]]; then
+      continue
+    fi
+
+    kind="$(classify_storage_kind "${rota_of["$top_name"]:-}")"
+    [[ "$kind" == "SSD" || "$kind" == "HDD" ]] || continue
+
+    quoted_source="${source//\"/\\\"}"
+    quoted_target="${target//\"/\\\"}"
+    if [[ -n "${seen_mounts["${quoted_source}|${quoted_target}"]+x}" ]]; then
+      continue
+    fi
+    seen_mounts["${quoted_source}|${quoted_target}"]=1
+
+    usage_line="$(get_mount_usage_mb "$machine" "$target")"
+    read -r used_mb total_mb pct_num <<<"$usage_line"
+    if [[ ! "${used_mb:-}" =~ ^[0-9]+$ || ! "${total_mb:-}" =~ ^[0-9]+$ || ! "${pct_num:-}" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+
+    used_by_kind["$kind"]=$(( ${used_by_kind["$kind"]:-0} + used_mb ))
+    total_by_kind["$kind"]=$(( ${total_by_kind["$kind"]:-0} + total_mb ))
+
+    if [[ "$pct_num" -gt 90 ]]; then
+      add_alert "HIGH" "$machine" "${kind} filesystem usage high on ${machine}: ${target} at ${pct_num}%"
+    fi
+  done <<<"$mounts_out"
+
+  if [[ "${total_by_kind["SSD"]:-0}" -gt 0 ]]; then
+    set_metric "$machine" "ssd" "$(format_usage_mb "${used_by_kind["SSD"]}" "${total_by_kind["SSD"]}")"
+  else
+    set_metric "$machine" "ssd" "none"
+  fi
+
+  if [[ "${total_by_kind["HDD"]:-0}" -gt 0 ]]; then
+    set_metric "$machine" "hdd" "$(format_usage_mb "${used_by_kind["HDD"]}" "${total_by_kind["HDD"]}")"
+  else
+    set_metric "$machine" "hdd" "none"
+  fi
+
+  return 0
+}
+
 parse_args() {
   local mode_count=0
 
@@ -289,6 +460,7 @@ run_cmd() {
     bash -lc "$cmd"
   else
     ssh \
+      -n \
       -o BatchMode=yes \
       -o ConnectTimeout="$SSH_TIMEOUT" \
       "$machine" \
@@ -308,6 +480,7 @@ run_privileged_cmd() {
     fi
   else
     ssh \
+      -n \
       -o BatchMode=yes \
       -o ConnectTimeout="$SSH_TIMEOUT" \
       "$machine" \
@@ -378,7 +551,6 @@ is_allowed_ip() {
 collect_quick_metrics() {
   local machine="$1"
   local out tailscale_ip load1 cores cpu_pct ram used total ram_pct swap swap_used swap_total swap_pct
-  local root_line root_fs root_used_mb root_total_mb root_pct_num
 
   out="$(run_cmd "$machine" "hostname" 2>/dev/null || true)"
   [[ -n "$out" ]] || out="$machine"
@@ -438,16 +610,7 @@ collect_quick_metrics() {
     set_metric "$machine" "swap" "0/0 MB"
   fi
 
-  root_line="$(run_cmd "$machine" "df -Pm / | awk 'NR==2{t=\$2; a=\$4; u=t-a; p=(t>0)?int(u*100/t):0; print \$1, u, t, p}'" 2>/dev/null || true)"
-  read -r root_fs root_used_mb root_total_mb root_pct_num <<<"$root_line"
-  if [[ "${root_used_mb:-}" =~ ^[0-9]+$ && "${root_total_mb:-}" =~ ^[0-9]+$ && "${root_pct_num:-}" =~ ^[0-9]+$ ]]; then
-    set_metric "$machine" "disk_root" "$(format_mb "$root_used_mb")/$(format_mb "$root_total_mb") (${root_pct_num}%)"
-    if [[ "$root_pct_num" -gt 90 ]]; then
-      add_alert "HIGH" "$machine" "Disk usage high on ${machine} root partition: ${root_pct_num}%"
-    fi
-  else
-    set_metric "$machine" "disk_root" "unknown"
-  fi
+  collect_storage_metrics "$machine" || true
 }
 
 collect_active_sessions() {
@@ -499,32 +662,9 @@ collect_active_sessions() {
 
 collect_default_metrics() {
   local machine="$1"
-  local root_line home_line root_fs root_used_mb root_total_mb root_pct_num home_fs home_used_mb home_total_mb home_pct_num
   local failed_units docker_lines docker_count battery ports_out ports_rc
 
   collect_active_sessions "$machine" || true
-
-  root_line="$(run_cmd "$machine" "df -Pm / | awk 'NR==2{t=\$2; a=\$4; u=t-a; p=(t>0)?int(u*100/t):0; print \$1, u, t, p}'" 2>/dev/null || true)"
-  read -r root_fs root_used_mb root_total_mb root_pct_num <<<"$root_line"
-  if [[ "${root_used_mb:-}" =~ ^[0-9]+$ && "${root_total_mb:-}" =~ ^[0-9]+$ && "${root_pct_num:-}" =~ ^[0-9]+$ ]]; then
-    set_metric "$machine" "disk_root" "$(format_mb "$root_used_mb")/$(format_mb "$root_total_mb") (${root_pct_num}%)"
-    if [[ "$root_pct_num" -gt 90 ]]; then
-      add_alert "HIGH" "$machine" "Disk usage high on ${machine} root partition: ${root_pct_num}%"
-    fi
-  else
-    set_metric "$machine" "disk_root" "unknown"
-  fi
-
-  home_line="$(run_cmd "$machine" "df -Pm /home 2>/dev/null | awk 'NR==2{t=\$2; a=\$4; u=t-a; p=(t>0)?int(u*100/t):0; print \$1, u, t, p}'" || true)"
-  read -r home_fs home_used_mb home_total_mb home_pct_num <<<"$home_line"
-  if [[ -n "${home_fs:-}" && "$home_fs" != "$root_fs" ]]; then
-    set_metric "$machine" "disk_home" "$(format_mb "$home_used_mb")/$(format_mb "$home_total_mb") (${home_pct_num}%)"
-    if [[ "${home_pct_num:-0}" =~ ^[0-9]+$ ]] && [[ "${home_pct_num:-0}" -gt 90 ]]; then
-      add_alert "HIGH" "$machine" "Disk usage high on ${machine} /home partition: ${home_pct_num}%"
-    fi
-  else
-    set_metric "$machine" "disk_home" "same as /"
-  fi
 
   failed_units="$(run_cmd "$machine" "systemctl --failed --no-legend --plain 2>/dev/null | wc -l" || true)"
   failed_units="$(trim_ws "$failed_units")"
@@ -783,11 +923,11 @@ render_text() {
     printf '  %-22s %s\n' "Tailscale:" "$(get_metric "$machine" "tailscale")"
     printf '  %-22s %s\n' "CPU:" "$(colored_metric "$machine" "cpu")"
     printf '  %-22s %s\n' "RAM:" "$(colored_metric "$machine" "ram")"
-    printf '  %-22s %s\n' "Disk /:" "$(colored_metric "$machine" "disk_root")"
+    printf '  %-22s %s\n' "SSD:" "$(colored_metric "$machine" "ssd")"
+    printf '  %-22s %s\n' "HDD:" "$(colored_metric "$machine" "hdd")"
 
     if [[ "$MODE" != "quick" ]]; then
       printf '  %-22s %s\n' "Swap:" "$(get_metric "$machine" "swap")"
-      printf '  %-22s %s\n' "Disk /home:" "$(colored_metric "$machine" "disk_home")"
       printf '  %-22s %s\n' "Active SSH sessions:" "$(get_metric "$machine" "active_ssh_sessions")"
       printf '  %-22s %s\n' "Suspicious active IPs:" "$(get_metric "$machine" "suspicious_active_ips")"
       printf '  %-22s %s\n' "Failed systemd units:" "$(get_metric "$machine" "failed_systemd_units")"

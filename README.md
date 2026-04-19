@@ -4,7 +4,7 @@ CLI tool to monitor the health of machines connected via Tailscale.
 
 ## What it does
 
-- Collects system metrics (CPU, RAM, disk, swap, Docker, systemd, listening ports)
+- Collects system metrics (CPU, RAM, SSD/HDD usage, swap, Docker, systemd, listening ports)
 - Checks active SSH sessions and login history against per-machine IP allowlists
 - Supports local and remote (SSH) metric collection
 - Color-coded output with alerts for critical thresholds
@@ -49,7 +49,7 @@ mstat [OPTIONS] [<machine>]
 - `<machine>` — also check a remote machine via SSH (requires `~/.ssh/config` entry)
 
 **Mode flags** (mutually exclusive):
-- `--quick` — uptime, tailscale, CPU, RAM only
+- `--quick` — uptime, tailscale, CPU, RAM, SSD, HDD
 - `--full` — add speed test, pending updates, zombie processes (~30s)
 - `--security` — add login history audit + failed SSH attempts
 
@@ -76,10 +76,21 @@ The following IPs are automatically treated as safe (never flagged):
 
 Any other IP not in the machine's allowlist triggers a **HIGH** or **CRITICAL** alert.
 
+## Storage rules
+
+`mstat` reports only internal mounted filesystems and summarizes them into `SSD` and `HDD`.
+
+The following are excluded from SSD/HDD totals:
+- External or removable storage (USB, hotplug, removable media)
+- Non-block or pseudo filesystems such as loop, overlay, tmpfs, and squashfs
+
+Mounted internal OS filesystems such as `/`, `/boot`, and `/boot/efi` are included, so the totals reflect internal mounted storage on the machine rather than only data-only partitions.
+
 ## Testing
 
 ```bash
 bash tests/test_allowed_ip.sh
+bash tests/test_storage_metrics.sh
 ```
 
 ## Exit codes
