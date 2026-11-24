@@ -63,7 +63,7 @@ write_default_allowlist() {
 
   cat >"$ALLOWLIST_FILE" <<'EOF'
 # allowed-ips.conf — Tailscale IPs allowed to SSH into this machine
-# One IPv4 address per line. Lines starting with # are comments.
+# One IPv4 or IPv6 address per line. Lines starting with # are comments.
 # Example:
 # 100.64.0.1  # my-other-machine
 EOF

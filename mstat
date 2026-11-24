@@ -8,7 +8,7 @@ MODE="default"
 JSON_OUTPUT=0
 TARGET=""
 SSH_TIMEOUT=5
-SPEEDTEST_TIMEOUT=45
+SPEEDTEST_TIMEOUT=75
 
 CURRENT_IP=""
 CURRENT_MACHINE="unknown"
@@ -18,6 +18,7 @@ MACHINES_CONF="${MSTAT_MACHINES_CONF:-$HOME/.config/mstat/machines.conf}"
 
 HEALTH_ISSUE=0
 RUNTIME_ERROR=0
+INCOMPLETE=0
 
 declare -A METRICS=()
 declare -A ALLOWLIST_CACHE=()
@@ -67,7 +68,7 @@ Output Flags:
   --help       Show this help text
 
 Exit codes:
-  0  Healthy
+  0  Healthy, or a security metric could not be fully read (result INCOMPLETE)
   1  Health/security issue detected
   2  Usage/argument error
   3  Runtime/dependency error
@@ -162,6 +163,17 @@ format_bytes() {
     awk -v b="$bytes" 'BEGIN {printf "%.0fK", b/1024}'
   else
     printf '%dB' "$bytes"
+  fi
+}
+
+format_age() {
+  local seconds="$1"
+  if [[ "$seconds" -ge 172800 ]]; then
+    printf '%dd' $((seconds / 86400))
+  elif [[ "$seconds" -ge 3600 ]]; then
+    printf '%dh' $((seconds / 3600))
+  else
+    printf '%dm' $((seconds / 60))
   fi
 }
 
@@ -488,19 +500,76 @@ run_privileged_cmd() {
   fi
 }
 
+# Print an IP in one form: IPv6 lowercase and compressed, IPv4-mapped IPv6 as IPv4.
+# The zone of an address (%eth0) is kept. Anything that is not IPv6 is printed as it is.
+canonical_ip() {
+  local raw="$1"
+  local ip="${raw%%%*}" zone="" group zeros fill
+  local -a head=() tail=() groups=()
+  local octet='(25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})'
+
+  [[ "$raw" == *%* ]] && zone="%${raw#*%}"
+  ip="${ip,,}"
+  if [[ "$ip" =~ ^(.*:)$octet\.$octet\.$octet\.$octet$ ]]; then
+    printf -v ip '%s%x:%x' "${BASH_REMATCH[1]}" \
+      $((10#${BASH_REMATCH[2]} * 256 + 10#${BASH_REMATCH[3]})) \
+      $((10#${BASH_REMATCH[4]} * 256 + 10#${BASH_REMATCH[5]}))
+  fi
+
+  if [[ "$ip" != *:*:* || "$ip" =~ [^:]:$ ]]; then
+    printf '%s' "$raw"
+    return
+  fi
+
+  IFS=: read -ra head <<<"${ip%%::*}"
+  if [[ "$ip" == *::* ]]; then
+    IFS=: read -ra tail <<<"${ip#*::}"
+    head+=(0)
+    for ((fill = 8 - ${#head[@]} - ${#tail[@]}; fill > 0; fill--)); do
+      head+=(0)
+    done
+  fi
+  groups=("${head[@]}" "${tail[@]}")
+
+  ip=":"
+  for group in "${groups[@]}"; do
+    if [[ "${#groups[@]}" -ne 8 || ! "$group" =~ ^[0-9a-f]{1,4}$ ]]; then
+      printf '%s' "$raw"
+      return
+    fi
+    printf -v ip '%s%x:' "$ip" "$((16#$group))"
+  done
+
+  if [[ -z "$zone" && "$ip" =~ ^:0:0:0:0:0:ffff:([0-9a-f]+):([0-9a-f]+):$ ]]; then
+    printf '%d.%d.%d.%d' \
+      $((16#${BASH_REMATCH[1]} / 256)) $((16#${BASH_REMATCH[1]} % 256)) \
+      $((16#${BASH_REMATCH[2]} / 256)) $((16#${BASH_REMATCH[2]} % 256))
+    return
+  fi
+
+  # Replace the first longest run of two or more zero groups with ::
+  for zeros in :0:0:0:0:0:0:0:0: :0:0:0:0:0:0:0: :0:0:0:0:0:0: :0:0:0:0:0: :0:0:0:0: :0:0:0: :0:0:; do
+    if [[ "$ip" == *"$zeros"* ]]; then
+      ip="${ip/"$zeros"/::}"
+      break
+    fi
+  done
+  [[ "$ip" == ::* ]] || ip="${ip#:}"
+  [[ "$ip" == *:: ]] || ip="${ip%:}"
+  printf '%s%s' "$ip" "$zone"
+}
+
 normalize_ip() {
   local raw="$1"
   local ip="$raw"
 
-  if [[ "$raw" =~ ^\[([0-9a-fA-F:]+)\]:[0-9]+$ ]]; then
-    ip="${BASH_REMATCH[1]}"
+  if [[ "$raw" =~ ^\[([0-9a-fA-F:.]+)(%[^]]+)?\](%[^]:]+)?:[0-9]+$ ]]; then
+    ip="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
   elif [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):[0-9]+$ ]]; then
     ip="${BASH_REMATCH[1]}"
-  elif [[ "$raw" =~ ^([0-9a-fA-F:]+):[0-9]+$ && "$raw" == *:*:* ]]; then
-    ip="${raw%:*}"
   fi
 
-  printf '%s' "$ip"
+  canonical_ip "$ip"
 }
 
 looks_like_ip() {
@@ -541,11 +610,18 @@ load_allowed_ips() {
 
 is_allowed_ip() {
   local machine="$1"
-  local ip="$2"
+  local ip entry
+  ip="$(canonical_ip "$2")"
 
   [[ "$ip" == "127.0.0.1" || "$ip" == "::1" || "$ip" == "0.0.0.0" ]] && return 0
 
-  grep -qxF "$ip" <<<"${ALLOWLIST_CACHE["$machine"]:-}"
+  # A link-local address names one host only together with its zone
+  [[ "$ip" =~ ^fe[89ab][0-9a-f]: && "$ip" != *%* ]] && return 1
+
+  while IFS= read -r entry; do
+    [[ -n "$entry" && "$(canonical_ip "$entry")" == "$ip" ]] && return 0
+  done <<<"${ALLOWLIST_CACHE["$machine"]:-}"
+  return 1
 }
 
 collect_quick_metrics() {
@@ -629,7 +705,9 @@ collect_active_sessions() {
   fi
 
   who_ips="$(run_cmd "$machine" "who -u 2>/dev/null | sed -n 's/.*(\\([^)]*\\)).*/\\1/p'" || true)"
-  ss_peers="$(run_cmd "$machine" "ss -Htnp state established '( sport = :22 )' 2>/dev/null | awk '{print \$5}'" || true)"
+  # With a state filter, ss omits the State column, so the peer is column 4.
+  # ss prints the zone of a link-local connection only on the local address (column 3).
+  ss_peers="$(run_cmd "$machine" "ss -Htnp state established '( sport = :22 )' 2>/dev/null | awk '{peer = \$4; if (peer ~ /^\\[fe[89ab][0-9a-f]:/ && peer !~ /%/ && match(\$3, /%[^:]+:/)) sub(/\\]/, \"]\" substr(\$3, RSTART, RLENGTH - 1), peer); print peer}'" || true)"
 
   while IFS= read -r candidate; do
     candidate="$(trim_ws "$candidate")"
@@ -799,10 +877,179 @@ detect_ssh_unit() {
   run_cmd "$machine" "if systemctl list-unit-files --type=service --no-legend | grep -q '^ssh\\.service'; then echo ssh; elif systemctl list-unit-files --type=service --no-legend | grep -q '^sshd\\.service'; then echo sshd; else echo ''; fi" 2>/dev/null || true
 }
 
+# Run a log command as the user, and with sudo if that fails.
+# Returns 1 if the log cannot be read and 2 if sudo is not possible.
+read_log() {
+  local machine="$1"
+  local plain_cmd="$2"
+  local privileged_cmd="$3"
+  local out
+
+  if out="$(run_cmd "$machine" "$plain_cmd" 2>/dev/null)"; then
+    printf '%s' "$out"
+    return 0
+  fi
+
+  out="$(run_privileged_cmd "$machine" "( ${privileged_cmd} ) || echo __NO_LOG__" 2>/dev/null)" || return 2
+  printf '%s' "$out"
+  [[ "$out" != *__NO_LOG__ ]]
+}
+
+# Commands that print how much of a window of some days a log covers: "__COVERAGE__" and then
+# "full", a number of seconds, or "unknown". They expect the epoch of the oldest entry in $first.
+coverage_cmd() {
+  local days="$1"
+  printf '%s' "now=\$(date +%s); if [[ ! \$first =~ ^[0-9]+\$ || \$first -gt \$now ]]; then echo __COVERAGE__ unknown; elif [[ \$first -gt \$((now - ${days} * 86400)) ]]; then echo __COVERAGE__ \$((now - first)); else echo __COVERAGE__ full; fi"
+}
+
+# Print the coverage and the journal lines of the ssh unit that match a pattern. Returns like read_log.
+# The journal is readable when it holds any line of the unit, from any date.
+read_ssh_journal() {
+  local machine="$1"
+  local unit="$2"
+  local days="$3"
+  local pattern="$4"
+  local probe query
+
+  probe="journalctl -q -u ${unit} -n 1 --no-pager"
+  # The lines of sshd are in the system journal, so its oldest entry counts (user journals can reach further back)
+  query="first=\$(journalctl -q _UID=0 -o short-unix --no-pager 2>/dev/null | head -n 1); first=\${first%%.*}; $(coverage_cmd "$days"); "
+  query+="journalctl -q -u ${unit} --since '${days} days ago' --no-pager 2>/dev/null | { grep -E '${pattern}' || true; }"
+
+  # Without sudo, journalctl exits 0 and leaves out what the user may not see. Trust it only when
+  # it shows a line that root logged for the unit and no system journal file is closed to the user.
+  read_log "$machine" \
+    "set -o pipefail; for f in {/var,/run}/log/journal{,/*{,/system*}}; do [[ ! -e \$f || -r \$f ]] || exit 1; done; ${probe} _UID=0 2>/dev/null | awk 'END {exit !NR}' && { ${query}; }" \
+    "set -o pipefail; ${probe} 2>/dev/null | awk 'END {exit !NR}' && { ${query}; }"
+}
+
+# The same for auth.log and, before it, auth.log.1. The log is readable when it was written to in
+# the last day and holds any line of sshd, from any date.
+read_auth_log() {
+  local machine="$1"
+  local days="$2"
+  local pattern="$3"
+  local prog cmd
+
+  # Keep the lines of the window. A line starts with 2026-11-24T10:00:00+05:30 or, without a year, Nov 24 10:00:00.
+  # A line with any other date is kept.
+  prog='NR == 1 {low = substr(from, 6)} '
+  prog+='/^([^ ]+|[A-Z][a-z][a-z] +[0-9]+ [^ ]+) [^ ]+ sshd(-session|-auth)?\[/ {seen = 1} '
+  prog+="!/${pattern}/ {next} "
+  prog+='from == "" || to == "" {print; next} '
+  prog+='$1 ~ /^[0-9][0-9][0-9][0-9]-/ {if (substr($1, 1, 19) >= from) print; next} '
+  prog+='{month = index("JanFebMarAprMayJunJulAugSepOctNovDec", $1); stamp = sprintf("%02d-%02dT%s", (month + 2) / 3, $2, $3)} '
+  prog+='!month || (low <= to ? stamp >= low && stamp <= to : stamp >= low || stamp <= to) {print} '
+  prog+='END {exit !seen}'
+
+  cmd="log=/var/log/auth.log; [[ -s \$log && -r \$log && -n \$(find -L \$log -mmin -1440) ]] || exit 1; logs=(\$log); [[ -s \$log.1 && -r \$log.1 ]] && logs=(\$log.1 \$log); "
+  cmd+="stamp=\$(awk '{print (\$1 ~ /^[0-9]/ ? \$1 : \$1 \" \" \$2 \" \" \$3); exit}' \${logs[0]}); first=\$(date -d \"\$stamp\" +%s 2>/dev/null); "
+  # A date without a year that is far in the future is from last year
+  cmd+="[[ \$stamp != [0-9]* && \$first =~ ^[0-9]+\$ && \$first -gt \$((\$(date +%s) + 15552000)) ]] && first=\$((first - 31536000)); $(coverage_cmd "$days"); "
+  cmd+="awk -v from=\"\$(date -d '${days} days ago' +%Y-%m-%dT%H:%M:%S)\" -v to=\"\$(date +%m-%dT%H:%M:%S)\" '${prog}' \"\${logs[@]}\""
+
+  read_log "$machine" "$cmd" "$cmd"
+}
+
+# Print the coverage in the output of a log reader
+log_coverage() {
+  sed -n '/^__COVERAGE__ /{s///p;q}' <<<"$1"
+}
+
+# Print a number that is larger for a longer coverage
+coverage_rank() {
+  case "$1" in
+    full) printf '9999999999' ;;
+    "" | *[!0-9]*) printf -- '-1' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Print the ssh log lines that match a pattern: those of the journal, the line "__AUTH_LOG__", and, if the
+# journal does not cover the window, those of auth.log. The first two lines give the source with the
+# longer coverage ("__SOURCE__") and that coverage. Returns like read_log.
+read_ssh_log() {
+  local machine="$1"
+  local unit="$2"
+  local days="$3"
+  local pattern="$4"
+  local journal="" journal_rc=1 auth="" auth_rc=1 auth_coverage
+  local source="journal" coverage=""
+
+  if [[ -n "$unit" ]]; then
+    journal="$(read_ssh_journal "$machine" "$unit" "$days" "$pattern")"
+    journal_rc=$?
+  fi
+  [[ "$journal_rc" -eq 0 ]] && coverage="$(log_coverage "$journal")"
+
+  if [[ "$coverage" != "full" ]]; then
+    auth="$(read_auth_log "$machine" "$days" "$pattern")"
+    auth_rc=$?
+    auth_coverage="$(log_coverage "$auth")"
+    if [[ "$auth_rc" -eq 0 ]] && [[ "$journal_rc" -ne 0 || "$(coverage_rank "$auth_coverage")" -gt "$(coverage_rank "$coverage")" ]]; then
+      source="auth.log"
+      coverage="$auth_coverage"
+    fi
+  fi
+
+  printf '__SOURCE__ %s\n__COVERAGE__ %s\n%s\n__AUTH_LOG__\n%s\n' "$source" "$coverage" "$journal" "$auth"
+  [[ "$journal_rc" -eq 0 ]] || return "$auth_rc"
+}
+
+# Print the source, the coverage and the pts/ lines of last. It reaches back to the date in its
+# "wtmp begins" line or, if it printed as many entries as it may, to its oldest entry.
+# Only pts/ lines: excludes local console sessions (seat0, :0, :1, reboot, system boot),
+# which show 0.0.0.0 as a placeholder. -w stops last from cutting an IPv6 address at 16 characters.
+read_last() {
+  local machine="$1"
+  local days="$2"
+  local prog
+
+  prog='{date = match($0, / [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[^ ]+/) ? substr($0, RSTART + 1, RLENGTH - 1) : ""} '
+  prog+='/^[^ ]+ begins / {print (entries < 100 ? date : oldest); exit} '
+  prog+='NF {entries++; oldest = date}'
+  run_cmd "$machine" "out=\$(LC_ALL=C last -i -w -n 100 --time-format iso 2>/dev/null) || exit 1; stamp=\$(awk '${prog}' <<<\"\$out\"); first=\$(date -d \"\${stamp:-none}\" +%s 2>/dev/null); echo __SOURCE__ last; $(coverage_cmd "$days"); grep 'pts/' <<<\"\$out\" || true"
+}
+
+# True if the file system of / and the machine ID are both younger than some days. An unknown date is not younger.
+installed_within() {
+  local machine="$1"
+  local days="$2"
+  run_cmd "$machine" "now=\$(date +%s); for t in \"\$(stat -c %W /)\" \"\$(stat -Lc %Y /etc/machine-id)\"; do [[ \$t =~ ^[0-9]+\$ && \$t -gt \$((now - ${days} * 86400)) && \$t -le \$now ]] || exit 1; done" >/dev/null 2>&1
+}
+
+# Set a metric that comes from a log. If the log does not cover the window, show what it covers;
+# the result is then incomplete, unless the system itself is younger than the window.
+# A value from auth.log always names its source.
+set_log_metric() {
+  local machine="$1"
+  local key="$2"
+  local value="$3"
+  local days="$4"
+  local lines="$5"
+  local source coverage text
+
+  source="$(sed -n '/^__SOURCE__ /{s///p;q}' <<<"$lines")"
+  coverage="$(log_coverage "$lines")"
+  case "$coverage" in
+    full)
+      [[ "$source" == "auth.log" ]] && value+=" (auth.log)"
+      set_metric "$machine" "$key" "$value"
+      return
+      ;;
+    "" | *[!0-9]*) text="${source:-log} coverage unknown" ;;
+    *) text="${source} covers $(format_age "$coverage")" ;;
+  esac
+
+  set_metric "$machine" "$key" "${value} (${text})"
+  add_warning "${key} on ${machine}: ${text}, the window is ${days}d"
+  installed_within "$machine" "$days" || INCOMPLETE=1
+}
+
 collect_security_metrics() {
   local machine="$1"
-  local last_out history_ips ip suspicious_history=""
-  local ssh_unit logs logs_rc fail_summary
+  local history_lines history_ips="" history_unread="" ip suspicious_history=""
+  local ssh_unit logs logs_rc fail_summary key value
   declare -A seen_history=()
 
   if [[ -z "${ALLOWLIST_CACHE["$machine"]:-}" ]]; then
@@ -811,12 +1058,22 @@ collect_security_metrics() {
     fi
   fi
 
-  # Filter last output to pts/ lines only — excludes local console sessions
-  # (seat0, :0, :1, reboot, system boot) which show 0.0.0.0 as a placeholder
-  last_out="$(run_cmd "$machine" "last -i -n 100 2>/dev/null | grep 'pts/'" || true)"
-  history_ips="$(grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$last_out" | sort -u || true)"
+  ssh_unit="$(trim_ws "$(detect_ssh_unit "$machine")")"
+
+  if history_lines="$(read_last "$machine" 30)"; then
+    history_ips="$(sed -nE 's/^.* pts\/[^ ]+ +([0-9A-Fa-f:.]+) .*$/\1/p' <<<"$history_lines" | sort -u || true)"
+  else
+    # No usable last (Ubuntu 26.04 does not ship it): read accepted logins from the ssh log
+    history_lines="$(read_ssh_log "$machine" "$ssh_unit" 30 'Accepted ')"
+    case "$?" in
+      1) history_unread="[unavailable]" ;;
+      2) history_unread="[requires sudo]" ;;
+    esac
+    history_ips="$(sed -nE 's/^[^]]*\]: Accepted [^ ]+ for .* from ([^ ]+) port [0-9]+ ssh2.*$/\1/p' <<<"$history_lines" | sort -u || true)"
+  fi
   while IFS= read -r ip; do
     [[ -n "$ip" ]] || continue
+    ip="$(normalize_ip "$ip")"
     [[ -n "${seen_history["$ip"]+x}" ]] && continue
     seen_history["$ip"]=1
     if ! is_allowed_ip "$machine" "$ip"; then
@@ -825,32 +1082,33 @@ collect_security_metrics() {
     fi
   done <<<"$history_ips"
 
-  if [[ -n "$suspicious_history" ]]; then
-    set_metric "$machine" "suspicious_login_history_ips" "${suspicious_history%, }"
+  suspicious_history="${suspicious_history%, }"
+  if [[ -z "$suspicious_history" && -n "$history_unread" ]]; then
+    set_metric "$machine" "suspicious_login_history_ips" "$history_unread"
   else
-    set_metric "$machine" "suspicious_login_history_ips" "none"
+    set_log_metric "$machine" "suspicious_login_history_ips" "${suspicious_history:-none}" 30 "$history_lines"
   fi
 
-  ssh_unit="$(trim_ws "$(detect_ssh_unit "$machine")")"
-  logs=""
-  if [[ -n "$ssh_unit" ]]; then
-    logs="$(run_privileged_cmd "$machine" "journalctl -u ${ssh_unit} --since '7 days ago' --no-pager 2>/dev/null | grep -E 'Failed password|Invalid user|authentication failure' || true" 2>/dev/null)"
-    logs_rc=$?
-    if [[ "$logs_rc" -ne 0 ]]; then
-      logs="$(run_privileged_cmd "$machine" "grep -E 'Failed password|Invalid user|authentication failure' /var/log/auth.log 2>/dev/null || true" 2>/dev/null)"
-      logs_rc=$?
-    fi
-  else
-    logs="$(run_privileged_cmd "$machine" "grep -E 'Failed password|Invalid user|authentication failure' /var/log/auth.log 2>/dev/null || true" 2>/dev/null)"
-    logs_rc=$?
-  fi
-
-  if [[ "${logs_rc:-1}" -eq 0 ]]; then
-    fail_summary="$(grep -Eo 'from ([0-9]{1,3}\.){3}[0-9]{1,3}' <<<"$logs" | awk '{print $2}' | sort | uniq -c | awk '{print $2":"$1}' | paste -sd', ' -)"
-    set_metric "$machine" "failed_ssh_attempts_7d" "${fail_summary:-none}"
+  logs="$(read_ssh_log "$machine" "$ssh_unit" 7 'Failed password|Invalid user|authentication failure')"
+  logs_rc=$?
+  if [[ "$logs_rc" -eq 0 ]]; then
+    # A username is hostile text: match sshd's own wording and take the address at the end of the line.
+    # Both logs can hold the same line: take the higher of the two counts. IPv6 is shown as [address]:count.
+    fail_summary="$(sed -nE -e '/^__AUTH_LOG__$/p' -e 's/^[^]]*\]: (message repeated [0-9]+ times: \[ )?(Failed password for|Invalid user) .* from ([0-9A-Fa-f:.]+(%[^] ]+)?)( port [0-9]+( ssh2)?)?( \[preauth\])?\]?$/\3/p' <<<"$logs" | awk '$0 == "__AUTH_LOG__" {split("", count); next} ++count[$0] > most[$0] {most[$0] = count[$0]} END {for (ip in most) print most[ip], ip}' | sort -k 2 | awk '{ip = $2; if (index(ip, ":")) ip = "[" ip "]"; printf "%s%s:%s", sep, ip, $1; sep = ", "}')"
+    set_log_metric "$machine" "failed_ssh_attempts_7d" "${fail_summary:-none}" 7 "$logs"
+  elif [[ "$logs_rc" -eq 1 ]]; then
+    set_metric "$machine" "failed_ssh_attempts_7d" "[unavailable]"
   else
     set_metric "$machine" "failed_ssh_attempts_7d" "[requires sudo]"
   fi
+
+  for key in suspicious_login_history_ips failed_ssh_attempts_7d; do
+    value="$(get_metric "$machine" "$key")"
+    if [[ "$value" == "[unavailable]" || "$value" == "[requires sudo]" ]]; then
+      INCOMPLETE=1
+      add_warning "Could not determine ${key} on ${machine}: ${value}"
+    fi
+  done
 
   return 0
 }
@@ -986,6 +1244,8 @@ render_text() {
     printf '\n%s\n' "$(colorize red "Result: RUNTIME ERROR")"
   elif [[ "$HEALTH_ISSUE" -eq 1 ]]; then
     printf '\n%s\n' "$(colorize red "Result: ISSUES DETECTED")"
+  elif [[ "$INCOMPLETE" -eq 1 ]]; then
+    printf '\n%s\n' "$(colorize yellow "Result: INCOMPLETE")"
   else
     printf '\n%s\n' "$(colorize green "Result: HEALTHY")"
   fi
@@ -1073,6 +1333,8 @@ render_json() {
     printf '"result":"runtime_error"'
   elif [[ "$HEALTH_ISSUE" -eq 1 ]]; then
     printf '"result":"issues_detected"'
+  elif [[ "$INCOMPLETE" -eq 1 ]]; then
+    printf '"result":"incomplete"'
   else
     printf '"result":"healthy"'
   fi

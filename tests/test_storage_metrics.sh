@@ -30,7 +30,7 @@ run_fixture_test() {
   collect_storage_metrics testbox
 }
 
-source <(sed '/^main "\$@"/d' ./mstat)
+source <(sed '/^main "\$@"/d' "$(dirname "${BASH_SOURCE[0]}")/../mstat")
 
 declare -A DF_FIXTURE=()
 FIXTURE_NAME=""

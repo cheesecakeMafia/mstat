@@ -50,7 +50,7 @@ mstat [OPTIONS] [<machine>]
 
 **Mode flags** (mutually exclusive):
 - `--quick` — uptime, tailscale, CPU, RAM, SSD, HDD
-- `--full` — add speed test, pending updates, zombie processes (~30s)
+- `--full` — add speed test, pending updates, zombie processes (the speed test can take up to 75s)
 - `--security` — add login history audit + failed SSH attempts
 
 **Output flags:**
@@ -74,6 +74,8 @@ The following IPs are automatically treated as safe (never flagged):
 - `127.0.0.1`, `::1` — loopback
 - `0.0.0.0` — placeholder for sessions with no network origin (tmux, screen, su, cron)
 
+IPv6 entries match in any spelling. A link-local IPv6 address matches only an entry with the same zone, for example `fe80::1%eth0`.
+
 Any other IP not in the machine's allowlist triggers a **HIGH** or **CRITICAL** alert.
 
 ## Storage rules
@@ -89,7 +91,9 @@ Mounted internal OS filesystems such as `/`, `/boot`, and `/boot/efi` are includ
 ## Testing
 
 ```bash
+bash tests/test_active_sessions.sh
 bash tests/test_allowed_ip.sh
+bash tests/test_security_metrics.sh
 bash tests/test_storage_metrics.sh
 ```
 
@@ -97,7 +101,7 @@ bash tests/test_storage_metrics.sh
 
 | Code | Meaning |
 |------|---------|
-| 0 | Healthy |
+| 0 | Healthy, or a security metric could not be fully read (result `INCOMPLETE`) |
 | 1 | Health or security issue detected |
 | 2 | Usage/argument error |
 | 3 | Runtime/dependency error |
